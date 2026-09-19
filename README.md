@@ -155,7 +155,62 @@ curl "http://localhost:8000/contracts/HT-2026-001/coverage?from=2026-01-01T00:00
 }
 ```
 
-### 5. 计费预览 — `POST /contracts/{contract_no}/charge-preview`
+### 5. 变更对比 — `GET /contracts/{contract_no}/changes`（v1.3 起）
+
+```bash
+curl "http://localhost:8000/contracts/HT-2026-001/changes?from=2026-01-01T00:00:00Z&to=2027-01-01T00:00:00Z&before_known_at=2026-02-01T00:00:00Z&after_known_at=2026-06-01T00:00:00Z"
+```
+
+分别按 `before_known_at` / `after_known_at` 两个认知时点筛选可见费率
+（与覆盖率分析同一可见性规则），以**两侧**业务区间边界的并集把窗口
+`[from, to)` 切分为连续片段，逐段返回 `before` / `after` 两侧的覆盖状态
+（`covered` / `gap` / `conflict`）与版本依据，并给出变更分类 `change`：
+
+| `change` | 含义 |
+|---|---|
+| `added` | before 为 gap、after 唯一覆盖（新认知到的费率） |
+| `removed` | before 唯一覆盖、after 为 gap |
+| `unchanged` | 两侧均 gap，或均唯一覆盖且费率相同 |
+| `rate_changed` | 两侧均唯一覆盖但费率不同 |
+| `conflict` | 任一侧存在多版本重叠冲突（冲突侧 `candidates` 给出全部候选） |
+
+分类与两侧候选完全一致的相邻片段合并为一段；每段附 `duration_us`
+（持续微秒数），`summary` 按五种分类汇总整个窗口的持续微秒数
+（`*_us` 字段，含零值分类，合计恒等于窗口总时长）。
+
+校验规则：
+
+| 情形 | 状态码 | `code` |
+|---|---|---|
+| `from >= to` | 422 | `INVALID_INTERVAL` |
+| `before_known_at >= after_known_at` | 422 | `INVALID_KNOWN_AT_ORDER` |
+| 缺少必填参数 / 时间格式非法 | 422 | `INVALID_REQUEST` |
+
+响应示例（上半年费率不变、下半年 0.052 → 0.058）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "from": "2026-01-01T00:00:00.000000+00:00",
+  "to": "2027-01-01T00:00:00.000000+00:00",
+  "before_known_at": "2026-02-01T00:00:00.000000+00:00",
+  "after_known_at": "2026-06-01T00:00:00.000000+00:00",
+  "segments": [
+    {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-06-01T00:00:00.000000+00:00",
+     "change": "unchanged", "duration_us": 13046400000000,
+     "before": {"status": "covered", "basis": {"rate_id": 1, "rate": 0.052, "version": 1, "...": "..."}, "candidates": []},
+     "after":  {"status": "covered", "basis": {"rate_id": 3, "rate": 0.052, "version": 3, "...": "..."}, "candidates": []}},
+    {"from": "2026-06-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+     "change": "rate_changed", "duration_us": 18489600000000,
+     "before": {"status": "covered", "basis": {"rate_id": 1, "rate": 0.052, "version": 1, "...": "..."}, "candidates": []},
+     "after":  {"status": "covered", "basis": {"rate_id": 2, "rate": 0.058, "version": 2, "...": "..."}, "candidates": []}}
+  ],
+  "summary": {"added_us": 0, "removed_us": 0, "unchanged_us": 13046400000000,
+              "rate_changed_us": 18489600000000, "conflict_us": 0}
+}
+```
+
+### 6. 计费预览 — `POST /contracts/{contract_no}/charge-preview`
 
 ```bash
 curl -X POST http://localhost:8000/contracts/HT-2026-001/charge-preview \
@@ -243,7 +298,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、变更对比、计费预览）
   db.py        SQLite 连接与自动建表
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py

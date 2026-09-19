@@ -36,6 +36,10 @@ class FutureKnownAtError(ValueError):
     """known_at 晚于当前时间，认知时点取自未来。"""
 
 
+class InvalidKnownAtOrderError(ValueError):
+    """before_known_at 不早于 after_known_at，认知时点顺序非法。"""
+
+
 def record_rate(
     contract_no: str,
     rate: float,
@@ -188,6 +192,42 @@ def get_timeline(contract_no: str) -> list[sqlite3.Row]:
     return list(rows)
 
 
+def _fetch_visible_rows(
+    conn: sqlite3.Connection, contract_no: str, f: str, t: str, ka: str
+) -> list[sqlite3.Row]:
+    """ka 时点可见（recorded_at <= ka 且未被取代）且业务区间与窗口 [f, t) 相交的版本。"""
+    rows = conn.execute(
+        "SELECT * FROM rate_versions "
+        "WHERE contract_no = ? "
+        "  AND recorded_at <= ? "
+        "  AND (superseded_at IS NULL OR superseded_at > ?) "
+        "  AND valid_from < ? "
+        "  AND (valid_to IS NULL OR valid_to > ?) "
+        "ORDER BY version ASC, id ASC",
+        (contract_no, ka, ka, t, f),
+    ).fetchall()
+    return list(rows)
+
+
+def _clip_rows(
+    rows: list[sqlite3.Row], f: str, t: str
+) -> list[tuple[str, str, sqlite3.Row]]:
+    """把版本的业务区间裁剪到窗口 [f, t)（NULL valid_to 用 INF 占位参与比较）。"""
+    return [
+        (max(row["valid_from"], f), min(row["valid_to"] or INF, t), row)
+        for row in rows
+    ]
+
+
+def _coverage_status(candidates: list[sqlite3.Row]) -> str:
+    """按候选版本数分类：0 → gap，1 → covered，>1 → conflict。"""
+    if not candidates:
+        return "gap"
+    if len(candidates) == 1:
+        return "covered"
+    return "conflict"
+
+
 def _visible_segments(contract_no: str, f: str, t: str, ka: str) -> list[dict]:
     """以 ka 时点可见版本的业务区间边界把窗口 [f, t) 切为连续片段。
 
@@ -200,22 +240,10 @@ def _visible_segments(contract_no: str, f: str, t: str, ka: str) -> list[dict]:
     无可见版本时自然得到覆盖整窗的单个 gap 段。
     """
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM rate_versions "
-            "WHERE contract_no = ? "
-            "  AND recorded_at <= ? "
-            "  AND (superseded_at IS NULL OR superseded_at > ?) "
-            "  AND valid_from < ? "
-            "  AND (valid_to IS NULL OR valid_to > ?) "
-            "ORDER BY version ASC, id ASC",
-            (contract_no, ka, ka, t, f),
-        ).fetchall()
+        rows = _fetch_visible_rows(conn, contract_no, f, t, ka)
 
-    # 可见版本的业务区间裁剪到查询窗口（NULL valid_to 用 INF 占位参与比较）
-    clipped = [
-        (max(row["valid_from"], f), min(row["valid_to"] or INF, t), row)
-        for row in rows
-    ]
+    # 可见版本的业务区间裁剪到查询窗口
+    clipped = _clip_rows(rows, f, t)
 
     # 以所有区间边界（含窗口端点）切分 [f, t)
     bounds = sorted({f, t, *(p for s, e, _ in clipped for p in (s, e))})
@@ -225,12 +253,7 @@ def _visible_segments(contract_no: str, f: str, t: str, ka: str) -> list[dict]:
     for seg_from, seg_to in zip(bounds, bounds[1:]):
         # 区间边界全部参与切分，故与片段相交的裁剪区间必完整覆盖该片段
         candidates = [row for s, e, row in clipped if s <= seg_from and e >= seg_to]
-        if not candidates:
-            seg_status = "gap"
-        elif len(candidates) == 1:
-            seg_status = "covered"
-        else:
-            seg_status = "conflict"
+        seg_status = _coverage_status(candidates)
         key = (seg_status, tuple(row["id"] for row in candidates))
         if key == last_key:
             segments[-1]["to"] = seg_to
@@ -260,14 +283,120 @@ def compute_coverage(
     return _visible_segments(contract_no, f, t, ka), ka
 
 
-# 费用与时长占比的小数精度（预览口径）
-CHARGE_SCALE = 6
-
-
 def _duration_us(f: str, t: str) -> int:
     """两个等宽 ISO 字符串之间的时长（微秒）。"""
     delta = parse(t) - parse(f)
     return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+# ---------- 双认知时点变更对比 ----------
+
+# 变更分类：added / removed / unchanged / rate_changed / conflict
+CHANGE_KINDS = ("added", "removed", "unchanged", "rate_changed", "conflict")
+
+
+def _classify_change(
+    before_status: str,
+    after_status: str,
+    before_candidates: list[sqlite3.Row],
+    after_candidates: list[sqlite3.Row],
+) -> str:
+    """按两侧覆盖状态分类一个原子片段（规则优先级自上而下）。"""
+    if "conflict" in (before_status, after_status):
+        return "conflict"  # 任一侧数据冲突，整段标记冲突
+    if before_status == "gap" and after_status == "covered":
+        return "added"
+    if before_status == "covered" and after_status == "gap":
+        return "removed"
+    if before_status == after_status == "gap":
+        return "unchanged"
+    # 剩余情形：两侧均唯一覆盖，费率相同为 unchanged，否则 rate_changed
+    if before_candidates[0]["rate"] == after_candidates[0]["rate"]:
+        return "unchanged"
+    return "rate_changed"
+
+
+def compute_changes(
+    contract_no: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    before_known_at: datetime,
+    after_known_at: datetime,
+) -> dict:
+    """对比两个认知时点下窗口 [from, to) 的费率覆盖差异。
+
+    分别按 before_known_at / after_known_at 筛出可见版本，以两侧业务区间边界的
+    并集把窗口切分为连续原子片段，逐段给出两侧状态（covered / gap / conflict）、
+    版本依据与变更分类（分类规则见 _classify_change）；分类与两侧候选完全一致
+    的相邻片段合并为一段，并按分类汇总持续微秒数（含零值分类）。
+
+    返回 {"from", "to", "before_known_at", "after_known_at", "segments", "summary"}；
+    每个 segment 为 {"from", "to", "change", "duration_us",
+    "before": {"status", "candidates"}, "after": {"status", "candidates"}}；
+    summary 为 {"added_us", "removed_us", "unchanged_us", "rate_changed_us",
+    "conflict_us"}，各值合计恒等于窗口总时长。
+    """
+    f = iso(from_dt)
+    t = iso(to_dt)
+    if f >= t:
+        raise InvalidIntervalError("from 必须早于 to")
+    bka = iso(before_known_at)
+    aka = iso(after_known_at)
+    if bka >= aka:
+        raise InvalidKnownAtOrderError(
+            f"before_known_at={bka} 必须早于 after_known_at={aka}"
+        )
+
+    with connect() as conn:
+        before_clipped = _clip_rows(_fetch_visible_rows(conn, contract_no, f, t, bka), f, t)
+        after_clipped = _clip_rows(_fetch_visible_rows(conn, contract_no, f, t, aka), f, t)
+
+    # 两侧边界取并集切分 [f, t)，保证每个原子片段在两侧各自只命中一组固定候选
+    bounds = sorted({f, t, *(p for s, e, _ in before_clipped + after_clipped for p in (s, e))})
+
+    segments = []
+    summary = {f"{kind}_us": 0 for kind in CHANGE_KINDS}
+    last_key = None  # 上一段的 (分类, before 候选 id 元组, after 候选 id 元组)，用于相邻段合并
+    for seg_from, seg_to in zip(bounds, bounds[1:]):
+        before_candidates = [row for s, e, row in before_clipped if s <= seg_from and e >= seg_to]
+        after_candidates = [row for s, e, row in after_clipped if s <= seg_from and e >= seg_to]
+        before_status = _coverage_status(before_candidates)
+        after_status = _coverage_status(after_candidates)
+        change = _classify_change(before_status, after_status, before_candidates, after_candidates)
+        duration = _duration_us(seg_from, seg_to)
+        summary[f"{change}_us"] += duration
+        key = (
+            change,
+            tuple(row["id"] for row in before_candidates),
+            tuple(row["id"] for row in after_candidates),
+        )
+        if key == last_key:
+            segments[-1]["to"] = seg_to
+            segments[-1]["duration_us"] += duration
+        else:
+            segments.append(
+                {
+                    "from": seg_from,
+                    "to": seg_to,
+                    "change": change,
+                    "duration_us": duration,
+                    "before": {"status": before_status, "candidates": before_candidates},
+                    "after": {"status": after_status, "candidates": after_candidates},
+                }
+            )
+            last_key = key
+    return {
+        "from": f,
+        "to": t,
+        "before_known_at": bka,
+        "after_known_at": aka,
+        "segments": segments,
+        "summary": summary,
+    }
+
+
+# 费用与时长占比的小数精度（预览口径）
+CHARGE_SCALE = 6
 
 
 def compute_charge_preview(

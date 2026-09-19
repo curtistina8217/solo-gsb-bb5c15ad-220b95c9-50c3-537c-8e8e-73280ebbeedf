@@ -568,6 +568,196 @@ def test_coverage_open_ended_and_default_known_at(client):
     ]
 
 
+# ---------- 双认知时点变更对比 ----------
+
+DAY_US = 86400 * 1_000_000  # 一天的微秒数
+
+
+def get_changes(client, contract, **params):
+    return client.get(f"/contracts/{contract}/changes", params=params)
+
+
+def test_changes_rate_changed_and_unchanged(client):
+    """部分重叠修订：费率不变的区段 unchanged（版本依据已切换），变化的区段 rate_changed。"""
+    post_rate(client, contract_no="CH-1", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    revision = post_rate(client, contract_no="CH-1", rate=0.08,
+                         valid_from="2026-06-01T00:00:00Z",
+                         valid_to="2027-01-01T00:00:00Z",
+                         recorded_at="2026-03-01T00:00:00Z").json()
+    assert revision["superseded_rate_ids"] == [1]
+    (retained,) = revision["retained_versions"]
+    assert retained["version"] == 3
+
+    r = get_changes(client, "CH-1",
+                    **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                       "before_known_at": "2026-02-01T00:00:00Z",
+                       "after_known_at": "2026-03-02T00:00:00Z"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["contract_no"] == "CH-1"
+    assert data["from"] == "2026-01-01T00:00:00.000000+00:00"
+    assert data["to"] == "2027-01-01T00:00:00.000000+00:00"
+    assert data["before_known_at"] == "2026-02-01T00:00:00.000000+00:00"
+    assert data["after_known_at"] == "2026-03-02T00:00:00.000000+00:00"
+
+    segs = data["segments"]
+    assert [(s["from"], s["to"], s["change"]) for s in segs] == [
+        ("2026-01-01T00:00:00.000000+00:00", "2026-06-01T00:00:00.000000+00:00", "unchanged"),
+        ("2026-06-01T00:00:00.000000+00:00", "2027-01-01T00:00:00.000000+00:00", "rate_changed"),
+    ]
+    # 上半年：两侧均唯一覆盖且费率同为 0.05 → unchanged，但版本依据 v1 → 补偿版本 v3
+    first = segs[0]
+    assert first["before"]["status"] == "covered"
+    assert first["before"]["basis"]["version"] == 1
+    assert first["before"]["basis"]["rate"] == 0.05
+    assert first["before"]["candidates"] == []
+    assert first["after"]["status"] == "covered"
+    assert first["after"]["basis"]["version"] == 3
+    assert first["after"]["basis"]["rate"] == 0.05
+    # 下半年：0.05 → 0.08
+    second = segs[1]
+    assert second["before"]["basis"]["version"] == 1
+    assert second["after"]["basis"]["version"] == 2
+    assert second["after"]["basis"]["rate"] == 0.08
+
+    # 持续微秒数：段内求和 = 分类汇总 = 整个窗口（2026 年共 365 天）
+    summary = data["summary"]
+    assert summary["unchanged_us"] == first["duration_us"] == 151 * DAY_US
+    assert summary["rate_changed_us"] == second["duration_us"] == 214 * DAY_US
+    assert summary["added_us"] == summary["removed_us"] == summary["conflict_us"] == 0
+    assert sum(s["duration_us"] for s in segs) == 365 * DAY_US
+
+
+def test_changes_added(client):
+    """费率在两个认知时点之间录入：gap → covered 的区段标记 added。"""
+    post_rate(client, contract_no="CH-2", rate=0.05,
+              valid_from="2026-03-01T00:00:00Z", valid_to="2026-09-01T00:00:00Z",
+              recorded_at="2026-02-01T00:00:00Z")
+    data = get_changes(client, "CH-2",
+                       **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                          "before_known_at": "2026-01-15T00:00:00Z",
+                          "after_known_at": "2026-02-02T00:00:00Z"}).json()
+    segs = data["segments"]
+    assert [(s["change"], s["before"]["status"], s["after"]["status"]) for s in segs] == [
+        ("unchanged", "gap", "gap"),
+        ("added", "gap", "covered"),
+        ("unchanged", "gap", "gap"),
+    ]
+    added = segs[1]
+    assert added["from"] == "2026-03-01T00:00:00.000000+00:00"
+    assert added["to"] == "2026-09-01T00:00:00.000000+00:00"
+    assert added["before"]["basis"] is None
+    assert added["after"]["basis"]["version"] == 1
+    assert added["after"]["basis"]["rate"] == 0.05
+    summary = data["summary"]
+    assert summary["added_us"] == added["duration_us"]
+    assert summary["unchanged_us"] == segs[0]["duration_us"] + segs[2]["duration_us"]
+    assert summary["added_us"] + summary["unchanged_us"] == 365 * DAY_US
+
+
+def test_changes_removed(client):
+    """注入将被取代的脏数据：after 时点已被取代且无替代版本 → covered → gap 为 removed。"""
+    post_rate(client, contract_no="CH-3", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE rate_versions "
+            "SET superseded_at = '2026-06-01T00:00:00.000000+00:00' "
+            "WHERE contract_no = 'CH-3'"
+        )
+    data = get_changes(client, "CH-3",
+                       **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                          "before_known_at": "2026-03-01T00:00:00Z",
+                          "after_known_at": "2026-07-01T00:00:00Z"}).json()
+    (seg,) = data["segments"]
+    assert seg["change"] == "removed"
+    assert seg["before"]["status"] == "covered"
+    assert seg["before"]["basis"]["version"] == 1
+    assert seg["after"]["status"] == "gap"
+    assert seg["after"]["basis"] is None
+    assert seg["after"]["candidates"] == []
+    assert data["summary"]["removed_us"] == seg["duration_us"] == 365 * DAY_US
+
+
+def test_changes_conflict_on_either_side(client):
+    """after 侧注入重叠脏数据 → 重叠区段整段标记 conflict 并附该侧全部候选。"""
+    post_rate(client, contract_no="CH-4", rate=0.05,
+              valid_from="2026-01-01T00:00:00Z", valid_to="2027-01-01T00:00:00Z",
+              recorded_at="2026-01-01T00:00:00Z")
+    db = os.environ["DATABASE_PATH"]
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rate_versions "
+            "(contract_no, rate, valid_from, valid_to, recorded_at, version) "
+            "VALUES ('CH-4', 0.99, '2026-06-01T00:00:00.000000+00:00', "
+            "        '2026-09-01T00:00:00.000000+00:00', "
+            "        '2026-03-01T00:00:00.000000+00:00', 2)"
+        )
+    data = get_changes(client, "CH-4",
+                       **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                          "before_known_at": "2026-02-01T00:00:00Z",
+                          "after_known_at": "2026-03-02T00:00:00Z"}).json()
+    segs = data["segments"]
+    assert [s["change"] for s in segs] == ["unchanged", "conflict", "unchanged"]
+    conflict = segs[1]
+    assert conflict["from"] == "2026-06-01T00:00:00.000000+00:00"
+    assert conflict["to"] == "2026-09-01T00:00:00.000000+00:00"
+    assert conflict["before"]["status"] == "covered"
+    assert conflict["before"]["basis"]["version"] == 1
+    assert conflict["after"]["status"] == "conflict"
+    assert conflict["after"]["basis"] is None
+    assert [c["version"] for c in conflict["after"]["candidates"]] == [1, 2]
+    summary = data["summary"]
+    assert summary["conflict_us"] == conflict["duration_us"]
+    assert summary["unchanged_us"] == segs[0]["duration_us"] + segs[2]["duration_us"]
+
+
+def test_changes_unknown_contract_all_unchanged(client):
+    """合同不存在（两侧均无可见版本）→ 整窗 unchanged，不报 404。"""
+    r = get_changes(client, "GHOST",
+                    **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                       "before_known_at": "2026-01-01T00:00:00Z",
+                       "after_known_at": "2026-06-01T00:00:00Z"})
+    assert r.status_code == 200
+    data = r.json()
+    (seg,) = data["segments"]
+    assert seg["change"] == "unchanged"
+    assert seg["before"]["status"] == seg["after"]["status"] == "gap"
+    assert data["summary"]["unchanged_us"] == seg["duration_us"] == 365 * DAY_US
+
+
+def test_changes_invalid_window_422(client):
+    for frm, to in [("2026-09-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                    ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")]:
+        r = get_changes(client, "CH-X",
+                        **{"from": frm, "to": to,
+                           "before_known_at": "2026-01-01T00:00:00Z",
+                           "after_known_at": "2026-02-01T00:00:00Z"})
+        assert r.status_code == 422
+        assert r.json()["detail"]["code"] == "INVALID_INTERVAL"
+
+
+def test_changes_known_at_order_422(client):
+    """before_known_at 必须严格早于 after_known_at。"""
+    for bka, aka in [("2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+                     ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")]:
+        r = get_changes(client, "CH-X",
+                        **{"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z",
+                           "before_known_at": bka, "after_known_at": aka})
+        assert r.status_code == 422
+        assert r.json()["detail"]["code"] == "INVALID_KNOWN_AT_ORDER"
+
+
+def test_changes_missing_params_422(client):
+    r = client.get("/contracts/CH-X/changes")
+    assert r.status_code == 422
+    assert r.json()["code"] == "INVALID_REQUEST"
+
+
 # ---------- 计费预览 ----------
 
 def post_preview(client, contract, **kw):

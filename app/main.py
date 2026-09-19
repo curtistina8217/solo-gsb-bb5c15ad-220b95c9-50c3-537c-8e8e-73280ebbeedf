@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="合同费率双时态追溯 API",
-    version="1.2.0",
+    version="1.3.0",
     description="按业务时间（valid_at）与认知时间（known_at）双维度追溯合同费率，修订只追加版本、不覆盖历史。",
     lifespan=lifespan,
 )
@@ -94,6 +94,43 @@ class CoverageResponse(BaseModel):
     to: str = Field(description="查询窗口终点（不含）")
     known_at: str = Field(description="实际使用的认知时点")
     segments: list[CoverageSegment]
+
+
+class ChangeSideView(BaseModel):
+    status: str = Field(description="该认知时点下的覆盖状态：covered / gap / conflict")
+    basis: Optional[VersionView] = Field(default=None, description="covered 时命中版本的唯一依据")
+    candidates: list[VersionView] = Field(default_factory=list, description="conflict 时的全部候选版本")
+
+
+class ChangeSegmentView(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: str = Field(alias="from", description="片段起点（含）")
+    to: str = Field(description="片段终点（不含）")
+    change: str = Field(description="added / removed / unchanged / rate_changed / conflict")
+    duration_us: int = Field(description="该片段的持续时长（微秒）")
+    before: ChangeSideView = Field(description="before_known_at 时点下的覆盖状态")
+    after: ChangeSideView = Field(description="after_known_at 时点下的覆盖状态")
+
+
+class ChangeSummary(BaseModel):
+    added_us: int = Field(description="gap→covered 片段的总时长（微秒）")
+    removed_us: int = Field(description="covered→gap 片段的总时长（微秒）")
+    unchanged_us: int = Field(description="无变化片段的总时长（微秒）")
+    rate_changed_us: int = Field(description="费率变化片段的总时长（微秒）")
+    conflict_us: int = Field(description="任一侧冲突片段的总时长（微秒）")
+
+
+class ChangesResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    contract_no: str
+    from_: str = Field(alias="from", description="查询窗口起点（含）")
+    to: str = Field(description="查询窗口终点（不含）")
+    before_known_at: str = Field(description="较早认知时点")
+    after_known_at: str = Field(description="较晚认知时点")
+    segments: list[ChangeSegmentView]
+    summary: ChangeSummary = Field(description="各变更分类的持续微秒数汇总")
 
 
 class ChargeLineIn(BaseModel):
@@ -288,6 +325,59 @@ def coverage(
             )
             for seg in segments
         ],
+    )
+
+
+@app.get("/contracts/{contract_no}/changes", response_model=ChangesResponse)
+def changes(
+    contract_no: str,
+    from_: datetime = Query(alias="from", description="查询窗口起点（含），ISO-8601"),
+    to: datetime = Query(description="查询窗口终点（不含），ISO-8601"),
+    before_known_at: datetime = Query(description="较早认知时点，ISO-8601"),
+    after_known_at: datetime = Query(description="较晚认知时点，ISO-8601，须晚于 before_known_at"),
+):
+    """变更对比：分别按 before_known_at / after_known_at 两个认知时点筛选可见费率，
+    以两侧业务区间边界的并集把 [from, to) 切为连续片段，逐段返回 before/after
+    状态及版本依据并分类（added / removed / unchanged / rate_changed / conflict；
+    分类与两侧候选完全一致的相邻段合并），并汇总各分类的持续微秒数。"""
+    try:
+        result = logic.compute_changes(contract_no, from_, to, before_known_at, after_known_at)
+    except logic.InvalidIntervalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_INTERVAL", "message": str(exc)},
+        )
+    except logic.InvalidKnownAtOrderError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "INVALID_KNOWN_AT_ORDER", "message": str(exc)},
+        )
+
+    def side_view(side: dict) -> ChangeSideView:
+        return ChangeSideView(
+            status=side["status"],
+            basis=to_view(side["candidates"][0]) if side["status"] == "covered" else None,
+            candidates=[to_view(r) for r in side["candidates"]] if side["status"] == "conflict" else [],
+        )
+
+    return ChangesResponse(
+        contract_no=contract_no,
+        from_=iso(from_),
+        to=iso(to),
+        before_known_at=result["before_known_at"],
+        after_known_at=result["after_known_at"],
+        segments=[
+            ChangeSegmentView(
+                from_=seg["from"],
+                to=seg["to"],
+                change=seg["change"],
+                duration_us=seg["duration_us"],
+                before=side_view(seg["before"]),
+                after=side_view(seg["after"]),
+            )
+            for seg in result["segments"]
+        ],
+        summary=ChangeSummary(**result["summary"]),
     )
 
 

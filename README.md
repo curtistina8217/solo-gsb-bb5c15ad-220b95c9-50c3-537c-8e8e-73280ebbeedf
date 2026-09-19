@@ -229,6 +229,70 @@ curl -X POST http://localhost:8000/contracts/HT-2026-001/charge-preview \
 }
 ```
 
+### 6. 变更对比 — `GET /contracts/{contract_no}/changes`
+
+```bash
+curl "http://localhost:8000/contracts/HT-2026-001/changes?from=2026-01-01T00:00:00Z&to=2027-01-01T00:00:00Z&before_known_at=2026-02-01T00:00:00Z&after_known_at=2026-06-01T00:00:00Z"
+```
+
+分别按 `before_known_at` / `after_known_at` 两个认知时点筛选可见费率，
+以**两侧业务区间边界的并集**把 `[from, to)` 切分为连续片段，逐段返回
+`before` / `after` 两侧的覆盖状态（结构与覆盖率分析的片段相同：`covered`
+附 `basis` 唯一依据、`conflict` 附 `candidates` 全部候选），并给出变更分类：
+
+| `change` | 含义 |
+|---|---|
+| `added` | before 为 `gap`、after 唯一覆盖（该认知区间内新可见的费率） |
+| `removed` | before 唯一覆盖、after 为 `gap` |
+| `unchanged` | 两侧均 `gap`，或均唯一覆盖且费率相同 |
+| `rate_changed` | 两侧均唯一覆盖但费率不同 |
+| `conflict` | 任一侧存在重叠冲突（脏数据） |
+
+分类与两侧候选完全一致的相邻片段合并为一段；每段附 `duration_us`（持续微秒数），
+响应末尾的 `summary` 按分类汇总持续微秒数（五个 `*_us` 字段恒存在，合计等于
+窗口总时长）。四个时间参数均必填。
+
+校验规则（均返回 422 及稳定错误码）：
+
+| 情形 | `code` |
+|---|---|
+| `from >= to` | `INVALID_INTERVAL` |
+| `before_known_at >= after_known_at` | `INVALID_KNOWN_AT_ORDER` |
+| 缺少必填参数 / 时间格式非法 | `INVALID_REQUEST` |
+
+响应示例（3 月起费率由 0.052 修订为 0.058：前半段同费率补偿版本 → `unchanged`，
+后半段费率变化 → `rate_changed`）：
+
+```json
+{
+  "contract_no": "HT-2026-001",
+  "from": "2026-01-01T00:00:00.000000+00:00",
+  "to": "2027-01-01T00:00:00.000000+00:00",
+  "before_known_at": "2026-02-01T00:00:00.000000+00:00",
+  "after_known_at": "2026-06-01T00:00:00.000000+00:00",
+  "segments": [
+    {"from": "2026-01-01T00:00:00.000000+00:00", "to": "2026-03-01T00:00:00.000000+00:00",
+     "change": "unchanged", "duration_us": 5097600000000,
+     "before": {"status": "covered",
+                "basis": {"rate_id": 1, "rate": 0.052, "version": 1, "...": "..."},
+                "candidates": []},
+     "after":  {"status": "covered",
+                "basis": {"rate_id": 3, "rate": 0.052, "version": 3, "...": "..."},
+                "candidates": []}},
+    {"from": "2026-03-01T00:00:00.000000+00:00", "to": "2027-01-01T00:00:00.000000+00:00",
+     "change": "rate_changed", "duration_us": 26438400000000,
+     "before": {"status": "covered",
+                "basis": {"rate_id": 1, "rate": 0.052, "version": 1, "...": "..."},
+                "candidates": []},
+     "after":  {"status": "covered",
+                "basis": {"rate_id": 2, "rate": 0.058, "version": 2, "...": "..."},
+                "candidates": []}}
+  ],
+  "summary": {"added_us": 0, "removed_us": 0, "unchanged_us": 5097600000000,
+              "rate_changed_us": 26438400000000, "conflict_us": 0}
+}
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -243,7 +307,7 @@ pytest                 # 运行测试
 ```
 app/
   main.py      FastAPI 路由与请求/响应模型
-  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览）
+  logic.py     双时态核心逻辑（追加式录入、时点查询、时间线、覆盖率分段、计费预览、变更对比）
   db.py        SQLite 连接与自动建表
   timeutil.py  UTC 时间规范化（等宽 ISO 字符串，可字典序比较）
 tests/test_api.py
